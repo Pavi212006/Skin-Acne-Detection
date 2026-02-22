@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Acne Level Predictor</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 50px; }
+        .result-box { margin-top: 20px; padding: 20px; border: 1px solid #ccc; background-color: #f9f9f9; }
+        .error-box { background-color: #fdd; border-color: #f00; color: #f00; }
+        h1 { color: #333; }
+        strong { color: #007bff; }
+        img { max-width: 100%; height: auto; border: 1px solid #ddd; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h1>CNN Acne Level Prediction</h1>
+    <p>Upload a skin image to get the predicted acne severity level.</p>
+    
+    <form method="POST" action="/predict" enctype="multipart/form-data">
+        <input type="file" name="file" accept="image/jpeg, image/png" required>
+        <button type="submit">Get Prediction</button>
+    </form>
+    
+    {% if prediction %}
+        <div class="result-box {% if error %}error-box{% endif %}">
+            <h2>Prediction Result:</h2>
+            <p>{{ prediction | safe }}</p>
+        </div>
+
+        {% if image_url and not error %}
+            <h3>Uploaded Image:</h3>
+            <img src="{{ image_url }}" alt="Uploaded Skin Image">
+        {% endif %}
+
+    {% endif %}
+
+</body>
+</html>
