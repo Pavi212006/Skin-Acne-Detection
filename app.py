@@ -8,7 +8,7 @@ from pathlib import Path
 import uuid
 
 import numpy as np
-from flask import Flask, render_template, request
+from flask import Flask, render_template, request, url_for
 from PIL import Image, UnidentifiedImageError
 from tensorflow.keras.models import load_model
 
@@ -22,8 +22,7 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 CLASSES = ["No Acne", "Mild Acne", "Moderate Acne", "Severe Acne"]
 
-# These normalization values are preserved from the original code. Confirm
-# them against the exact preprocessing used when this model was trained.
+# Preserved from the original code. Verify against the model's training pipeline.
 IMAGENET_MEANS = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STDS = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -42,7 +41,6 @@ try:
             "Download the model described in README.md and place it beside app.py."
         )
 except Exception as exc:
-    # Log startup detail to the server console, not to the public response.
     app.logger.exception("Could not load the CNN model: %s", exc)
     model = None
 
@@ -57,7 +55,6 @@ def prepare_image(image_file):
         with Image.open(image_file) as source:
             img = source.convert("RGB")
 
-        # Preserve aspect ratio by centering the image on a square canvas.
         width, height = img.size
         if width < 1 or height < 1:
             raise ValueError("Image has invalid dimensions.")
@@ -78,6 +75,7 @@ def file_too_large(_error):
         "index.html",
         prediction="Image is too large. Please upload an image smaller than 5 MB.",
         error=True,
+        image_url=None,
     ), 413
 
 @app.route("/", methods=["GET"])
@@ -125,22 +123,20 @@ def predict():
 
         predicted_index = int(np.argmax(scores))
         score = float(scores[predicted_index])
-
-        # The model's output is shown as a score, not a calibrated probability.
         result_text = (
             f"Model output label: {CLASSES[predicted_index]}. "
             f"Model output score: {score:.4f}. "
             "This is an experimental result, not a medical diagnosis."
         )
 
-        # Save only after the file has been decoded and processed successfully.
+        # Save a normalized JPEG copy only after successful decoding and inference.
         UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
         safe_filename = f"{uuid.uuid4().hex}.jpg"
         saved_path = UPLOAD_FOLDER / safe_filename
+        uploaded.stream.seek(0)
         with Image.open(uploaded.stream) as source:
             source.convert("RGB").save(saved_path, format="JPEG", quality=90)
 
-        from flask import url_for
         return render_template(
             "index.html",
             prediction=result_text,
@@ -161,5 +157,4 @@ def predict():
         ), 500
 
 if __name__ == "__main__":
-    # Debug mode is disabled by default; do not expose Flask's debugger publicly.
     app.run(debug=False)
