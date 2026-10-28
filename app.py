@@ -1,138 +1,165 @@
-import os
-import uuid # For generating unique filenames
+"""Flask prototype for running a supplied acne-image CNN model.
+
+This is an educational demonstration, not a medical diagnostic tool. Model
+weights and the original training/preprocessing pipeline must be verified
+before predictions can be interpreted as meaningful.
+"""
+from pathlib import Path
+import uuid
+
 import numpy as np
-from flask import Flask, request, render_template, redirect, url_for
+from flask import Flask, render_template, request
+from PIL import Image, UnidentifiedImageError
 from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing import image
-from PIL import Image
 
-# --- Configuration Variables ---
-
-MODEL_PATH = 'acne_cnn_model.h5' 
-UPLOAD_FOLDER = 'static/uploads'
-
-# CRITICAL FIX: Image Size based on model.summary()
-IMG_HEIGHT = 126   
-IMG_WIDTH = 126    
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = BASE_DIR / "acne_cnn_model.h5"
+UPLOAD_FOLDER = BASE_DIR / "static" / "uploads"
+IMG_HEIGHT = 126
+IMG_WIDTH = 126
 TARGET_SIZE = (IMG_WIDTH, IMG_HEIGHT)
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+CLASSES = ["No Acne", "Mild Acne", "Moderate Acne", "Severe Acne"]
 
-CLASSES = ['No Acne', 'Mild Acne', 'Moderate Acne', 'Severe Acne']
-
-# ImageNet means and standard deviations for Z-score normalization
-# This is used as the most likely pre-processing used during training.
-IMAGENET_MEANS = np.array([0.485, 0.456, 0.406])
-IMAGENET_STDS = np.array([0.229, 0.224, 0.225])
+# These normalization values are preserved from the original code. Confirm
+# them against the exact preprocessing used when this model was trained.
+IMAGENET_MEANS = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+IMAGENET_STDS = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 app = Flask(__name__)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_BYTES
+app.config["UPLOAD_FOLDER"] = str(UPLOAD_FOLDER)
 
-# Initialize model variable
 model = None
-
-# --- Model Loading ---
 try:
-    # FIX: Use compile=False and ensure model._make_predict_function() is removed
-    model = load_model(MODEL_PATH, compile=False) 
-    print(f"CNN Model '{MODEL_PATH}' loaded successfully.")
-except Exception as e:
-    # If loading fails, print the error to the console (where the true issue lies)
-    print(f"FATAL Error loading model: {e}")
+    if MODEL_PATH.is_file():
+        model = load_model(str(MODEL_PATH), compile=False)
+        print(f"CNN model loaded from {MODEL_PATH.name}.")
+    else:
+        print(
+            f"Model file not found: {MODEL_PATH.name}. "
+            "Download the model described in README.md and place it beside app.py."
+        )
+except Exception as exc:
+    # Log startup detail to the server console, not to the public response.
+    app.logger.exception("Could not load the CNN model: %s", exc)
     model = None
 
-# --- Image Preprocessing Function ---
-
-def prepare_image(img_path):
-    if not os.path.exists(img_path):
-        return None
-
+def prepare_image(image_file):
+    """Validate and preprocess an uploaded image for the expected model input."""
     try:
-        img = Image.open(img_path).convert('RGB')
-        
-        # 1. Aspect Ratio Preservation (Padding to handle any shape/size)
+        image_file.seek(0)
+        with Image.open(image_file) as source:
+            source.verify()
+
+        image_file.seek(0)
+        with Image.open(image_file) as source:
+            img = source.convert("RGB")
+
+        # Preserve aspect ratio by centering the image on a square canvas.
         width, height = img.size
+        if width < 1 or height < 1:
+            raise ValueError("Image has invalid dimensions.")
         max_dim = max(width, height)
-        new_img = Image.new(img.mode, (max_dim, max_dim), color='black') 
-        left = (max_dim - width) // 2
-        top = (max_dim - height) // 2
-        new_img.paste(img, (left, top))
-        
-        # 2. Resize to model's required input size (126x126)
-        img_resized = new_img.resize(TARGET_SIZE)
+        square = Image.new("RGB", (max_dim, max_dim), color=(0, 0, 0))
+        square.paste(img, ((max_dim - width) // 2, (max_dim - height) // 2))
+        resized = square.resize(TARGET_SIZE)
 
-        img_array = image.img_to_array(img_resized) # Range [0, 255]
-        
-        # 3. Rescale pixel values from [0, 255] to [0.0, 1.0]
-        img_array = img_array / 255.0  
+        array = np.asarray(resized, dtype=np.float32) / 255.0
+        array = (array - IMAGENET_MEANS) / IMAGENET_STDS
+        return np.expand_dims(array, axis=0)
+    except (UnidentifiedImageError, OSError, ValueError) as exc:
+        raise ValueError("Please upload a valid JPG or PNG image.") from exc
 
-        # 4. FIX: Z-Score Normalization for prediction consistency
-        # Processed Pixel = (Pixel/255.0 - Mean) / StdDev
-        img_array = (img_array - IMAGENET_MEANS) / IMAGENET_STDS
-        
-        # 5. Add batch dimension
-        img_array = np.expand_dims(img_array, axis=0)
-        
-        return img_array
-    except Exception as e:
-        print(f"Error processing image: {e}")
-        return None
+@app.errorhandler(413)
+def file_too_large(_error):
+    return render_template(
+        "index.html",
+        prediction="Image is too large. Please upload an image smaller than 5 MB.",
+        error=True,
+    ), 413
 
-# --- Flask Routes ---
-
-@app.route('/', methods=['GET'])
+@app.route("/", methods=["GET"])
 def index():
-    # FIX: Ensures the root URL works and does not return "Not Found"
-    return render_template('index.html', prediction=None)
+    return render_template("index.html", prediction=None, error=False, image_url=None)
 
-@app.route('/predict', methods=['POST'])
+@app.route("/predict", methods=["POST"])
 def predict():
     if model is None:
-        # Returns the error shown in your previous images
-        return render_template('index.html', prediction='Error: Model could not be loaded on the server.', error=True), 500
-        
-    if 'file' not in request.files:
-        return redirect(request.url)
-    
-    file = request.files['file']
-    if file.filename == '':
-        return redirect(request.url)
+        return render_template(
+            "index.html",
+            prediction="The model is unavailable. Check the server setup instructions.",
+            error=True,
+            image_url=None,
+        ), 503
 
-    if file:
-        # FIX: Generate a unique, safe filename to prevent link issues
-        original_filename = file.filename
-        file_extension = os.path.splitext(original_filename)[1]
-        unique_filename = str(uuid.uuid4()) + file_extension
-        
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-        
-        os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-        
-        try:
-            file.save(filepath)
-        except Exception as e:
-            print(f"Error saving file: {e}")
-            return render_template('index.html', prediction='Error: Could not save image file.', error=True), 500
+    uploaded = request.files.get("file")
+    if uploaded is None or not uploaded.filename:
+        return render_template(
+            "index.html",
+            prediction="Choose a JPG or PNG image before submitting.",
+            error=True,
+            image_url=None,
+        ), 400
 
-        processed_image = prepare_image(filepath)
-        
-        if processed_image is None:
-            return render_template('index.html', prediction='Error: Image processing failed.', error=True), 400
+    suffix = Path(uploaded.filename).suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        return render_template(
+            "index.html",
+            prediction="Unsupported file type. Upload a JPG or PNG image.",
+            error=True,
+            image_url=None,
+        ), 400
 
-        predictions = model.predict(processed_image)
-        
-        predicted_index = np.argmax(predictions[0])
-        confidence = predictions[0][predicted_index] * 100
-        predicted_label = CLASSES[predicted_index]
+    try:
+        processed = prepare_image(uploaded.stream)
+        output = np.asarray(model.predict(processed, verbose=0))
+        if output.ndim != 2 or output.shape[0] != 1 or output.shape[1] != len(CLASSES):
+            app.logger.error("Unexpected model output shape: %s", output.shape)
+            raise RuntimeError("The model output does not match the four configured classes.")
 
+        scores = output[0]
+        if not np.all(np.isfinite(scores)):
+            raise RuntimeError("The model returned invalid numeric scores.")
+
+        predicted_index = int(np.argmax(scores))
+        score = float(scores[predicted_index])
+
+        # The model's output is shown as a score, not a calibrated probability.
         result_text = (
-            f"The predicted acne level is: **{predicted_label}**"
-            f" (Confidence: {confidence:.2f}%)"
+            f"Model output label: {CLASSES[predicted_index]}. "
+            f"Model output score: {score:.4f}. "
+            "This is an experimental result, not a medical diagnosis."
         )
-        
-        # Return the URL using the unique filename
-        return render_template('index.html', 
-                               prediction=result_text, 
-                               image_url=url_for('static', filename=f'uploads/{unique_filename}'))
 
-if __name__ == '__main__':
-    # Add host='0.0.0.0' if running on a separate device, otherwise default is fine
-    app.run(debug=True)
+        # Save only after the file has been decoded and processed successfully.
+        UPLOAD_FOLDER.mkdir(parents=True, exist_ok=True)
+        safe_filename = f"{uuid.uuid4().hex}.jpg"
+        saved_path = UPLOAD_FOLDER / safe_filename
+        with Image.open(uploaded.stream) as source:
+            source.convert("RGB").save(saved_path, format="JPEG", quality=90)
+
+        from flask import url_for
+        return render_template(
+            "index.html",
+            prediction=result_text,
+            error=False,
+            image_url=url_for("static", filename=f"uploads/{safe_filename}"),
+        )
+    except ValueError as exc:
+        return render_template(
+            "index.html", prediction=str(exc), error=True, image_url=None
+        ), 400
+    except Exception:
+        app.logger.exception("Prediction failed.")
+        return render_template(
+            "index.html",
+            prediction="Prediction failed. Check the model file and server logs.",
+            error=True,
+            image_url=None,
+        ), 500
+
+if __name__ == "__main__":
+    # Debug mode is disabled by default; do not expose Flask's debugger publicly.
+    app.run(debug=False)
